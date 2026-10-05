@@ -1,315 +1,309 @@
-import React, { useState, useEffect } from 'react';
-import { FaFilePdf, FaDownload, FaHistory, FaSyncAlt, FaExclamationTriangle } from 'react-icons/fa';
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  LuScrollText,
+  LuDownload,
+  LuHistory,
+  LuRefreshCw,
+  LuTriangleAlert,
+  LuFileJson,
+  LuEye,
+  LuHardDrive,
+  LuCircleCheck,
+  LuActivity,
+  LuFileKey,
+  LuSearch,
+} from 'react-icons/lu';
+import { api, sessionUrls, certificateUrls } from '../lib/api';
+import {
+  formatBytes,
+  formatDate,
+  formatDuration,
+  formatRelative,
+  getMethodName,
+  statusLabel,
+  statusTone,
+} from '../lib/format';
+import { Badge, Button, EmptyState, IconButton, LoadingPanel, Segmented } from './ui/Primitives';
+import { useToast } from './ui/Toast';
 
-const API_BASE_URL = '/api';
-const BACKEND_BASE_URL = '';
-
-function Reports({ onBack, onViewCertificate }) {
+export default function Reports({ onViewCertificate, onNavigate }) {
   const [sessions, setSessions] = useState([]);
   const [certificates, setCertificates] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [activeTab, setActiveTab] = useState('sessions');
+  const [tab, setTab] = useState('certificates');
+  const [query, setQuery] = useState('');
+  const toast = useToast();
 
-  useEffect(() => {
-    loadSessions();
-    loadCertificates();
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    const [sessionsRes, certsRes] = await Promise.allSettled([
+      api.listSessions(50),
+      api.listCertificates(),
+    ]);
+
+    if (sessionsRes.status === 'fulfilled' && Array.isArray(sessionsRes.value)) {
+      setSessions(sessionsRes.value);
+    } else if (sessionsRes.status === 'rejected') {
+      setError(sessionsRes.reason?.message || 'Failed to load wipe sessions');
+    }
+
+    if (certsRes.status === 'fulfilled' && Array.isArray(certsRes.value?.certificates)) {
+      setCertificates(certsRes.value.certificates);
+    }
+
+    setLoading(false);
   }, []);
 
-  const loadSessions = async () => {
-    try {
-      setLoading(true);
-      setError('');
-      const response = await fetch(`${API_BASE_URL}/wipe/sessions`);
-      const data = await response.json();
-      setSessions(data);
-    } catch (err) {
-      setError('Failed to load wipe sessions');
-      console.error('Error loading sessions:', err);
-    } finally {
-      setLoading(false);
-    }
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const openFile = (url, label) => {
+    const win = window.open(url, '_blank', 'noopener');
+    if (!win) toast.info('Popup blocked', `Allow popups to open the ${label}.`);
   };
 
-  const loadCertificates = async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/certificates`);
-      const data = await response.json();
-      setCertificates(data.certificates || []);
-    } catch (err) {
-      console.error('Error loading certificates:', err);
-    }
-  };
-
-  const downloadReport = (sessionId) => {
-    window.open(`${API_BASE_URL}/reports/${sessionId}`, '_blank');
-  };
-
-  const downloadSignature = (sessionId) => {
-    window.open(`${API_BASE_URL}/reports/${sessionId}/signature`, '_blank');
-  };
-
-  const downloadJsonReport = (sessionId) => {
-    window.open(`${API_BASE_URL}/reports/${sessionId}/json`, '_blank');
-  };
-
-  const viewCertificate = (certificate) => {
-    if (onViewCertificate) {
-      onViewCertificate(certificate);
-    }
-  };
-
-  const formatDate = (dateString) => {
-    if (!dateString) return 'N/A';
-    return new Date(dateString).toLocaleString();
-  };
-
-  const formatDuration = (seconds) => {
-    if (!seconds) return 'N/A';
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = Math.floor(seconds % 60);
-    
-    if (hours > 0) {
-      return `${hours}h ${minutes}m ${secs}s`;
-    } else if (minutes > 0) {
-      return `${minutes}m ${secs}s`;
-    } else {
-      return `${secs}s`;
-    }
-  };
-
-  const getStatusIcon = (status) => {
-    switch (status) {
-      case 'completed':
-        return <FaDownload className="success-icon" />;
-      case 'failed':
-        return <FaExclamationTriangle className="error-icon" />;
-      case 'in_progress':
-        return <FaSyncAlt className="spinning-icon" />;
-      default:
-        return <FaHistory className="info-icon" />;
-    }
-  };
-
-  const getStatusColor = (status) => {
-    switch (status) {
-      case 'completed':
-        return 'success';
-      case 'failed':
-        return 'error';
-      case 'in_progress':
-        return 'warning';
-      default:
-        return 'info';
-    }
-  };
-
-  const getMethodDisplayName = (method) => {
-    const names = {
-      'nist_800_88': 'NIST 800-88',
-      'dod_5220_22_m': 'DoD 5220.22-M',
-      'gutmann': 'Gutmann',
-      'crypto_erase': 'Crypto Erase',
-      'ata_sanitize': 'ATA Sanitize',
-      'nvme_format': 'NVMe Format',
-      'single_pass': 'Single Pass',
-      'three_pass': 'Three Pass'
-    };
-    return names[method] || method;
-  };
-
-  if (loading) {
-    return (
-      <div className="card">
-        <h2><FaFilePdf/> Wipe Reports</h2>
-        <div className="loading">
-          <div className="spinner"></div>
-          <p>Loading reports...</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="card">
-        <h2><FaFilePdf/> Wipe Reports</h2>
-        <div className="error">
-          <FaExclamationTriangle className="error-icon"/>
-          <p>{error}</p>
-          <button onClick={loadSessions} className="retry-button">
-            <FaSyncAlt/> Retry
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const filteredCerts = certificates.filter((c) =>
+    query.trim() ? c.filename.toLowerCase().includes(query.trim().toLowerCase()) : true
+  );
 
   return (
-    <div className="card">
-      <h2><FaFilePdf/> Certificates & Reports</h2>
-      <p>View and download tamper-proof certificates of data destruction for all wipe operations.</p>
-      
-      <div className="tab-navigation">
-        <button 
-          className={`tab-button ${activeTab === 'sessions' ? 'active' : ''}`}
-          onClick={() => setActiveTab('sessions')}
-        >
-          <FaHistory/> Wipe Sessions
-        </button>
-        <button 
-          className={`tab-button ${activeTab === 'certificates' ? 'active' : ''}`}
-          onClick={() => setActiveTab('certificates')}
-        >
-          <FaFilePdf/> Certificates
-        </button>
-      </div>
-
-      {activeTab === 'sessions' ? (
-        sessions.length === 0 ? (
-          <div className="no-reports">
-            <FaFilePdf className="no-reports-icon"/>
-            <h3>No Wipe Sessions Found</h3>
-            <p>No wipe operations have been performed yet. Start by wiping a device to generate reports.</p>
-          </div>
-        ) : (
-        <div className="reports-table-container">
-          <table className="reports-table">
-            <thead>
-              <tr>
-                <th>Session ID</th>
-                <th>Method</th>
-                <th>Passes</th>
-                <th>Status</th>
-                <th>Started</th>
-                <th>Duration</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sessions.map((session) => (
-                <tr key={session.id}>
-                  <td className="session-id">#{session.id}</td>
-                  <td className="method">
-                    <span className="method-name">{getMethodDisplayName(session.method)}</span>
-                  </td>
-                  <td className="passes">{session.passes}</td>
-                  <td className={`status status-${getStatusColor(session.status)}`}>
-                    {getStatusIcon(session.status)}
-                    <span>{session.status.replace('_', ' ').toUpperCase()}</span>
-                  </td>
-                  <td className="started">{formatDate(session.started_at)}</td>
-                  <td className="duration">{formatDuration(session.duration_seconds)}</td>
-                  <td className="actions">
-                    {session.status === 'completed' && session.report_path && (
-                      <div className="action-buttons">
-                        <button 
-                          onClick={() => downloadReport(session.id)}
-                          className="download-button"
-                          title="Download PDF Report"
-                        >
-                          <FaFilePdf/> PDF
-                        </button>
-                        <button 
-                          onClick={() => downloadJsonReport(session.id)}
-                          className="download-button"
-                          title="Download JSON Certificate"
-                        >
-                          <FaFilePdf/> JSON
-                        </button>
-                        {session.signature_path && (
-                          <button 
-                            onClick={() => downloadSignature(session.id)}
-                            className="download-button"
-                            title="Download Signature"
-                          >
-                            <FaDownload/> Signature
-                          </button>
-                        )}
-                      </div>
-                    )}
-                    {session.status === 'failed' && (
-                      <span className="error-message">
-                        {session.error_message || 'Unknown error'}
-                      </span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        )
-      ) : (
-        certificates.length === 0 ? (
-          <div className="no-reports">
-            <FaFilePdf className="no-reports-icon"/>
-            <h3>No Certificates Found</h3>
-            <p>No certificates have been generated yet. Complete a wipe operation to generate certificates.</p>
-          </div>
-        ) : (
-          <div className="certificates-grid">
-            {certificates.map((cert, index) => (
-              <div key={index} className="certificate-card">
-                <div className="certificate-header">
-                  <div className="certificate-icon">
-                    {cert.type === 'PDF' ? <FaFilePdf/> : <FaFilePdf/>}
-                  </div>
-                  <div className="certificate-info">
-                    <h3>{cert.filename}</h3>
-                    <p className="certificate-type">{cert.type} Certificate</p>
-                  </div>
-                </div>
-                <div className="certificate-details">
-                  <div className="detail-item">
-                    <span className="label">Size:</span>
-                    <span className="value">{formatSize(cert.size)}</span>
-                  </div>
-                  <div className="detail-item">
-                    <span className="label">Created:</span>
-                    <span className="value">{formatDate(cert.created)}</span>
-                  </div>
-                </div>
-                <div className="certificate-actions">
-                  <button 
-                    onClick={() => viewCertificate(cert)}
-                    className="view-button"
-                  >
-                    <FaFilePdf/> View
-                  </button>
-                  <button 
-                    onClick={() => window.open(`/reports/${cert.filename}`, '_blank')}
-                    className="download-button"
-                  >
-                    <FaDownload/> Download
-                  </button>
-                </div>
+    <div className="page page--reports">
+      <section className="card card--flush">
+        <header className="card__header card__header--tabs">
+          <Segmented
+            ariaLabel="Report view"
+            value={tab}
+            onChange={setTab}
+            options={[
+              { value: 'certificates', label: 'Certificates', icon: LuScrollText, count: certificates.length },
+              { value: 'sessions', label: 'Wipe sessions', icon: LuHistory, count: sessions.length },
+            ]}
+          />
+          <div className="card__header-actions">
+            {tab === 'certificates' && certificates.length > 4 && (
+              <div className="search">
+                <LuSearch className="search__icon" aria-hidden="true" />
+                <input
+                  className="search__input"
+                  type="search"
+                  placeholder="Filter certificates"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  aria-label="Filter certificates"
+                />
               </div>
-            ))}
+            )}
+            <Button size="sm" variant="outline" icon={LuRefreshCw} onClick={load} loading={loading}>
+              Refresh
+            </Button>
           </div>
-        )
-      )}
+        </header>
 
-      <div className="reports-info">
-        <h3>About Reports</h3>
-        <ul>
-          <li><strong>Reports:</strong> PDF certificates containing wipe details, timestamps, and verification hashes</li>
-          <li><strong>Signatures:</strong> Digital signatures for tamper-proof verification of report authenticity</li>
-          <li><strong>Compliance:</strong> Reports meet NIST 800-88 and DoD 5220.22-M standards for audit purposes</li>
-        </ul>
-      </div>
+        <div className="card__content">
+          {loading ? (
+            <LoadingPanel label="Loading reports" rows={4} />
+          ) : tab === 'certificates' ? (
+            filteredCerts.length === 0 ? (
+              <EmptyState
+                icon={LuScrollText}
+                title={query ? 'No matching certificates' : 'No certificates yet'}
+                description={
+                  query
+                    ? 'No certificate filename matches your search.'
+                    : 'Certificates are issued automatically when an erasure completes. Run a wipe to generate your first one.'
+                }
+                action={
+                  query ? (
+                    <Button variant="outline" onClick={() => setQuery('')}>Clear filter</Button>
+                  ) : (
+                    <Button variant="primary" icon={LuHardDrive} onClick={() => onNavigate('devices')}>
+                      Start an erasure
+                    </Button>
+                  )
+                }
+              />
+            ) : (
+              <ul className="cert-grid">
+                {filteredCerts.map((cert) => {
+                  const isPdf = cert.type === 'PDF';
+                  return (
+                    <li className="cert" key={cert.filename}>
+                      <div className="cert__top">
+                        <span
+                          className={`cert__icon cert__icon--${isPdf ? 'danger' : 'info'}`}
+                          aria-hidden="true"
+                        >
+                          {isPdf ? <LuScrollText /> : <LuFileJson />}
+                        </span>
+                        <div className="cert__ident">
+                          <p className="cert__name zt-truncate" title={cert.filename}>
+                            {cert.filename}
+                          </p>
+                          <p className="cert__sub">
+                            <Badge tone={isPdf ? 'danger' : 'info'} size="sm">{cert.type}</Badge>
+                            <span>{formatBytes(cert.size)}</span>
+                          </p>
+                        </div>
+                      </div>
 
-      <div className="button-group">
-        <button onClick={onBack} className="secondary-button">
-          ← Back
-        </button>
-        <button onClick={() => { loadSessions(); loadCertificates(); }} className="secondary-button">
-          <FaSyncAlt/> Refresh
-        </button>
-      </div>
+                      <dl className="cert__meta">
+                        <div>
+                          <dt>Issued</dt>
+                          <dd>{formatDate(cert.created)}</dd>
+                        </div>
+                        <div>
+                          <dt>Age</dt>
+                          <dd>{formatRelative(cert.created)}</dd>
+                        </div>
+                      </dl>
+
+                      <div className="cert__actions">
+                        <Button size="sm" variant="secondary" icon={LuEye} onClick={() => onViewCertificate(cert)}>
+                          Inspect
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          icon={LuDownload}
+                          onClick={() => openFile(certificateUrls.file(cert.filename), 'certificate')}
+                        >
+                          Download
+                        </Button>
+                        <IconButton
+                          icon={LuFileKey}
+                          label="Download detached signature"
+                          variant="outline"
+                          onClick={() => openFile(certificateUrls.signature(cert.filename), 'signature')}
+                        />
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )
+          ) : error ? (
+            <EmptyState
+              icon={LuTriangleAlert}
+              tone="danger"
+              title="Could not load sessions"
+              description={error}
+              action={<Button variant="primary" icon={LuRefreshCw} onClick={load}>Try again</Button>}
+            />
+          ) : sessions.length === 0 ? (
+            <EmptyState
+              icon={LuHistory}
+              title="No wipe sessions recorded"
+              description="Device erasures are logged here with their method, duration and outcome. File-level wipes issue certificates without creating a session."
+              action={
+                <Button variant="primary" icon={LuHardDrive} onClick={() => onNavigate('devices')}>
+                  Start an erasure
+                </Button>
+              }
+            />
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th scope="col">Session</th>
+                    <th scope="col">Method</th>
+                    <th scope="col">Passes</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Started</th>
+                    <th scope="col">Duration</th>
+                    <th scope="col" className="table__right">Evidence</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sessions.map((s) => (
+                    <tr key={s.id}>
+                      <td><span className="mono table__id">#{s.id}</span></td>
+                      <td><span className="table__strong">{getMethodName(s.method)}</span></td>
+                      <td>{s.passes}</td>
+                      <td>
+                        <Badge
+                          tone={statusTone(s.status)}
+                          size="sm"
+                          icon={
+                            s.status === 'completed'
+                              ? LuCircleCheck
+                              : s.status === 'failed'
+                              ? LuTriangleAlert
+                              : LuActivity
+                          }
+                        >
+                          {statusLabel(s.status)}
+                        </Badge>
+                      </td>
+                      <td className="table__muted">{formatDate(s.started_at)}</td>
+                      <td className="table__muted">{formatDuration(s.duration_seconds)}</td>
+                      <td className="table__right">
+                        {s.status === 'completed' && s.report_path ? (
+                          <div className="table__actions">
+                            <IconButton
+                              icon={LuScrollText}
+                              label={`Download PDF report for session ${s.id}`}
+                              variant="outline"
+                              onClick={() => openFile(sessionUrls.pdf(s.id), 'PDF report')}
+                            />
+                            <IconButton
+                              icon={LuFileJson}
+                              label={`Download JSON certificate for session ${s.id}`}
+                              variant="outline"
+                              onClick={() => openFile(sessionUrls.json(s.id), 'JSON certificate')}
+                            />
+                            {s.signature_path && (
+                              <IconButton
+                                icon={LuFileKey}
+                                label={`Download signature for session ${s.id}`}
+                                variant="outline"
+                                onClick={() => openFile(sessionUrls.signature(s.id), 'signature')}
+                              />
+                            )}
+                          </div>
+                        ) : s.status === 'failed' ? (
+                          <span className="table__error zt-truncate" title={s.error_message || 'Unknown error'}>
+                            {s.error_message || 'Unknown error'}
+                          </span>
+                        ) : (
+                          <span className="table__muted">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="info-strip">
+        <div className="info-strip__item">
+          <span className="info-strip__icon" aria-hidden="true"><LuScrollText /></span>
+          <div>
+            <h4>PDF certificates</h4>
+            <p>Human-readable evidence with device details, hashes and an embedded verification QR code.</p>
+          </div>
+        </div>
+        <div className="info-strip__item">
+          <span className="info-strip__icon" aria-hidden="true"><LuFileKey /></span>
+          <div>
+            <h4>Detached signatures</h4>
+            <p>PKCS#7 (.p7s) for PDFs and RSA-PSS (.sig) for JSON, verifiable without ZeroTrace.</p>
+          </div>
+        </div>
+        <div className="info-strip__item">
+          <span className="info-strip__icon" aria-hidden="true"><LuCircleCheck /></span>
+          <div>
+            <h4>Audit ready</h4>
+            <p>Records align with NIST 800-88 and DoD 5220.22-M reporting expectations.</p>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
-
-export default Reports;

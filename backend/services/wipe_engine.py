@@ -63,6 +63,20 @@ def list_drives() -> Dict[str, Any]:
         logger.error(f"Failed to list drives: {e}")
         return {"ok": False, "error": str(e)}
 
+def _merge_device_info(drive_info: Dict[str, Any], extra: Dict[str, Any]) -> None:
+    """Merge supplementary device info without discarding values we already have.
+
+    get_device_info() is only fully implemented on Linux; on Windows and macOS
+    it returns None/"unknown" for most fields. A plain dict.update() therefore
+    overwrote the good model/size/serial/type values the platform listing had
+    just parsed, so every drive showed up in the UI as unknown with a null size.
+    """
+    for key, value in extra.items():
+        if value in (None, "", "unknown"):
+            continue
+        drive_info[key] = value
+
+
 def _list_linux_drives() -> List[Dict[str, Any]]:
     """List drives on Linux using lsblk"""
     try:
@@ -89,7 +103,7 @@ def _list_linux_drives() -> List[Dict[str, Any]]:
                 
                 # Get additional info using secure_wipe_service
                 additional_info = secure_wipe_service.get_device_info(drive_info["path"])
-                drive_info.update(additional_info)
+                _merge_device_info(drive_info, additional_info)
                 
                 drives.append(drive_info)
         
@@ -97,6 +111,21 @@ def _list_linux_drives() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Failed to list Linux drives: {e}")
         return []
+
+def _windows_device_type(media_type: str, bus_type: str) -> str:
+    """Map Get-PhysicalDisk MediaType/BusType onto our device type vocabulary."""
+    media = (media_type or "").strip().upper()
+    bus = (bus_type or "").strip().upper()
+    if bus == "NVME":
+        return "nvme"
+    if bus == "USB":
+        return "usb"
+    if media == "SSD":
+        return "ssd"
+    if media == "HDD":
+        return "hdd"
+    return "unknown"
+
 
 def _list_windows_drives() -> List[Dict[str, Any]]:
     """List drives on Windows using PowerShell"""
@@ -118,20 +147,24 @@ def _list_windows_drives() -> List[Dict[str, Any]]:
         drives = []
         
         for device in data if isinstance(data, list) else ([data] if data else []):
+            media_type = str(device.get("MediaType") or "")
+            bus_type = str(device.get("BusType") or "")
             drive_info = {
                 "name": device.get("FriendlyName", ""),
                 "path": f"\\\\.\\PhysicalDrive{device.get('DeviceID', '')}",
                 "size": str(device.get("Size", 0)),
                 "model": device.get("FriendlyName", ""),
                 "serial": device.get("SerialNumber", ""),
-                "is_rotational": device.get("MediaType") == "HDD",
+                "is_rotational": media_type.upper() == "HDD",
                 "mount_point": "",
-                "type": "ssd" if device.get("MediaType") == "SSD" else "hdd"
+                "type": _windows_device_type(media_type, bus_type),
             }
             
-            # Get additional info using secure_wipe_service
-            additional_info = secure_wipe_service.get_device_info(drive_info["path"])
-            drive_info.update(additional_info)
+            # No per-drive get_device_info() probe here: on Windows its only
+            # non-empty field is the device type, which it re-derives by spawning
+            # a PowerShell process *per drive* (~3s each). The bulk query above
+            # already returned MediaType and BusType, so /api/drives sat right on
+            # the frontend's 8s abort while adding no information.
             
             drives.append(drive_info)
         
@@ -169,7 +202,7 @@ def _list_macos_drives() -> List[Dict[str, Any]]:
                 
                 # Get additional info using secure_wipe_service
                 additional_info = secure_wipe_service.get_device_info(drive_info["path"])
-                drive_info.update(additional_info)
+                _merge_device_info(drive_info, additional_info)
                 
                 drives.append(drive_info)
         
@@ -189,7 +222,7 @@ def _sha256_head(device_path: str, head_bytes: int = 1024*1024) -> Optional[str]
         return None
 
 def _detect_original_filesystem(device_path: str) -> Optional[str]:
-    """Best-effort detection of original filesystem for a given device or volume.
+    r"""Best-effort detection of original filesystem for a given device or volume.
     - Windows: returns 'ntfs', 'fat32', 'exfat' for drive letters (e.g., D:\), None for PhysicalDrive.
     - Linux/macOS: attempts to parse lsblk/diskutil output.
     """
@@ -417,6 +450,12 @@ def initiate_wipe(device: str, method: str, passes: int = 1, force: bool = False
             "sha_before": sha_before,
             "sha_after": sha_after,
             "error": result.get("error"),
+            # Structured cause so the UI names the real failure instead of
+            # defaulting to "you need Administrator".
+            "error_category": result.get("error_category"),
+            "error_operation": result.get("error_operation"),
+            "win32_error": result.get("win32_error"),
+            "error_offset": result.get("error_offset"),
             "post_format": post_format
         }
         
@@ -431,11 +470,13 @@ def initiate_wipe(device: str, method: str, passes: int = 1, force: bool = False
             error_message=str(e)
         )
         
+        from services.secure_wipe import classify_wipe_exception
         return {
             "success": False,
             "session_id": session.id,
             "status": "failed",
-            "error": str(e)
+            "error": str(e),
+            **classify_wipe_exception(e),
         }
 
 # Legacy functions for backward compatibility

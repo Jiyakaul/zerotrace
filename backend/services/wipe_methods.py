@@ -6,10 +6,40 @@ import os
 import time
 import subprocess
 import secrets
-from typing import Optional, Callable, Dict, Any
+import tempfile
+from typing import Optional, Callable, Dict, Any, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class WipeOperationError(Exception):
+    """A wipe step failed, carrying what failed and why.
+
+    The category lets the UI show the actual problem (write failed, volume
+    locked, device disconnected, ...) instead of assuming every failure is a
+    missing Administrator token.
+    """
+
+    def __init__(self, message: str, *, category: str = "wipe_failed",
+                 operation: str = "", win32_error=None, offset=None, detail=None):
+        self.category = category
+        self.operation = operation
+        self.win32_error = win32_error
+        self.offset = offset
+        self.detail = detail
+        super().__init__(message)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "error": str(self),
+            "error_category": self.category,
+            "error_operation": self.operation,
+            "win32_error": self.win32_error,
+            "error_offset": self.offset,
+            "error_detail": self.detail,
+        }
+
 
 class WipeMethods:
     """Implementation of various wipe methods"""
@@ -19,6 +49,10 @@ class WipeMethods:
         self.is_windows = system == "windows"
         self.is_linux = system == "linux"
         self.is_macos = system == "darwin"
+        # Verification performed while the device was still locked by the
+        # overwrite. Preferred over re-opening the device afterwards - see
+        # _verify_zeroed().
+        self._inline_verification: Optional[Dict[str, Any]] = None
     
     def crypto_erase(self, device_path: str, device_type: str, 
                     progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
@@ -111,9 +145,15 @@ class WipeMethods:
         if progress_callback:
             progress_callback(70, "Verifying clear operation...")
         
-        # Verify by checking that device is zeroed
-        if not self._verify_zeroed(device_path):
-            raise Exception("Clear verification failed")
+        # Verify by reading the device back. Never softened: a failure here
+        # still aborts the wipe, but it now reports what was actually found.
+        verification = self._verify_zeroed(device_path)
+        if not verification["ok"]:
+            raise WipeOperationError(
+                f"Clear verification failed - {verification['summary']}",
+                category="verification_failed", operation="read-back verification",
+                detail=verification.get("regions"),
+            )
         
         # Step 3: Purge (prefer sanitize/crypto erase on SSD/NVMe; fallback overwrite; try discard)
         if progress_callback:
@@ -361,18 +401,23 @@ class WipeMethods:
                     except Exception:
                         is_admin = False
                     if not is_admin:
-                        raise Exception("Administrator privileges are required on Windows.")
+                        raise WipeOperationError(
+                            "Administrator privileges are required on Windows.",
+                            category="admin_required", operation="privilege check",
+                        )
                     if is_physical:
-                        # Use DiskPart 'clean all' to write zeros to entire disk
                         m = re.search(r"PhysicalDrive(\d+)", device_path, re.IGNORECASE)
                         if not m:
-                            raise Exception("Unable to parse Windows PhysicalDrive number.")
-                        disk_number = m.group(1)
-                        script = f"select disk {disk_number}\nclean all\n"
-                        subprocess.run([
-                            "powershell", "-NoProfile", "-Command",
-                            f"$tmp=[System.IO.Path]::GetTempFileName(); Set-Content -Path $tmp -Value @'\n{script}\n'@; diskpart /s $tmp | Out-Null; Remove-Item $tmp -Force"
-                        ], check=True)
+                            raise WipeOperationError(
+                                f"Could not parse a PhysicalDrive number from {device_path!r}.",
+                                category="invalid_target", operation="device path parse",
+                            )
+                        disk_number = int(m.group(1))
+                        self._windows_raw_overwrite(
+                            device_path, disk_number, progress_callback,
+                            offset=offset, max_progress=max_progress,
+                            pass_index=pass_num, pass_count=passes,
+                        )
                     else:
                         # Reject drive-letter/volume path to avoid partial clearing
                         raise Exception("On Windows, provide \\ \\.\\PhysicalDriveN for full-device secure wipe.")
@@ -391,7 +436,188 @@ class WipeMethods:
         except subprocess.CalledProcessError as e:
             raise Exception(f"Secure overwrite failed: {e}")
     
-    def _write_pattern(self, device_path: str, pattern: Optional[bytes], 
+    def _windows_raw_overwrite(self, device_path: str, disk_number: int,
+                               progress_callback: Optional[Callable] = None,
+                               offset: int = 0, max_progress: int = 100,
+                               pass_index: int = 0, pass_count: int = 1) -> None:
+        """Zero a Windows physical disk in-process, then verify while still locked.
+
+        Replaces `diskpart clean all`. The disk is held open and its volumes
+        locked for the whole write *and* the read-back, which closes the window
+        in which Windows would otherwise re-initialise the freshly-RAW disk and
+        write a new MBR to sector 0 before verification could run.
+        """
+        from services.win_raw_disk import WindowsRawDisk, RawDiskError
+
+        try:
+            with WindowsRawDisk(device_path, disk_number) as disk:
+                logger.info(
+                    "OVERWRITE: %s - %s bytes, pass %d/%d (in-process raw write, "
+                    "cache bypassed)",
+                    device_path, f"{disk.size:,}", pass_index + 1, pass_count,
+                )
+                disk.delete_drive_layout()
+
+                started = time.time()
+
+                def on_progress(done: int, total: int) -> None:
+                    pct = (done / total) if total else 0
+                    elapsed = time.time() - started
+                    rate = done / elapsed if elapsed > 0 else 0
+                    eta = ((total - done) / rate) if rate > 0 else 0
+                    logger.info(
+                        "OVERWRITE: %5.1f%%  %s / %s bytes  %.1f MB/s  eta %s",
+                        pct * 100, f"{done:,}", f"{total:,}",
+                        rate / (1024 * 1024), self._format_eta(eta),
+                    )
+                    if progress_callback:
+                        span = max_progress - offset
+                        # Share the band across passes so multi-pass methods
+                        # still report a monotonic percentage.
+                        base = offset + (span * pass_index // max(1, pass_count))
+                        width = span // max(1, pass_count)
+                        progress_callback(
+                            int(base + width * pct),
+                            f"Overwriting {device_path} - {pct * 100:.1f}% "
+                            f"({rate / (1024 * 1024):.0f} MB/s)",
+                        )
+
+                written = disk.write_pattern(progress_cb=on_progress)
+                elapsed = time.time() - started
+                logger.info(
+                    "OVERWRITE: wrote %s bytes in %.0fs (%.1f MB/s), buffers flushed",
+                    f"{written:,}", elapsed,
+                    (written / elapsed / (1024 * 1024)) if elapsed else 0,
+                )
+
+                if written < disk.size:
+                    raise WipeOperationError(
+                        f"Overwrite covered only {written:,} of {disk.size:,} bytes",
+                        category="write_failed", operation="write_pattern",
+                        offset=written,
+                    )
+
+                # Verify now, before the disk is released back to Windows.
+                inline = self._verify_via_handle(disk, device_path)
+                self._inline_verification = {
+                    "device": device_path,
+                    "at": time.time(),
+                    "result": inline,
+                }
+                if not inline["ok"]:
+                    raise WipeOperationError(
+                        f"Post-write verification failed - {inline['summary']}",
+                        category="verification_failed",
+                        operation="read-back verification (locked handle)",
+                        detail=inline.get("regions"),
+                    )
+
+        except RawDiskError as e:
+            # Surfaces the precise Win32 failure and byte offset instead of the
+            # silent success diskpart used to report. The category travels with
+            # the exception so the UI can describe the real problem rather than
+            # defaulting to "you need Administrator".
+            wrapped = WipeOperationError(
+                f"Raw overwrite of {device_path} failed - {e}",
+                category=e.category, operation=e.operation,
+                win32_error=e.code, offset=e.offset,
+            )
+            raise wrapped from e
+
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        seconds = int(max(0, seconds))
+        h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
+        if h:
+            return f"{h}h{m:02d}m"
+        if m:
+            return f"{m}m{s:02d}s"
+        return f"{s}s"
+
+    def _verify_via_handle(self, disk, device_path: str) -> Dict[str, Any]:
+        """Read-back verification through the still-open, locked disk handle."""
+        sample_size = 1024 * 1024
+        size = disk.size
+        align = self._SECTOR_ALIGN
+
+        if size > sample_size * 3:
+            regions = [
+                ("head", 0),
+                ("middle", ((size // 2) // align) * align),
+                ("tail", ((size - sample_size) // align) * align),
+            ]
+        else:
+            regions = [("head", 0)]
+
+        logger.info(
+            "VERIFY: target=%s size=%s bytes (locked handle, cache bypassed) "
+            "sample=%d bytes/region expected=0x00",
+            device_path, f"{size:,}", sample_size,
+        )
+
+        results = []
+        for name, off in regions:
+            entry = {"name": name, "offset": off, "requested": sample_size, "read": 0,
+                     "status": "ok", "nonzero": 0, "first_offset": -1,
+                     "first_value": 0, "context": "", "error": None}
+            try:
+                data = disk.read(off, sample_size)
+            except Exception as e:
+                entry.update(status="error", error=f"{type(e).__name__}: {e}")
+                logger.error("VERIFY: %-6s offset=%-14d READ FAILED: %s",
+                             name, off, entry["error"])
+                results.append(entry)
+                continue
+
+            entry["read"] = len(data)
+            nonzero = len(data) - data.count(0)
+            if nonzero:
+                first = next(i for i, b in enumerate(data) if b)
+                lo, hi = max(0, first - 8), min(len(data), first + 24)
+                entry.update(
+                    status="mismatch", nonzero=nonzero, first_offset=off + first,
+                    first_value=data[first], context=data[lo:hi].hex(" "),
+                )
+                logger.error(
+                    "VERIFY: %-6s offset=%-14d NOT ZERO - read=%d bytes, %d non-zero, "
+                    "first at byte %d = 0x%02X, context=[%s]",
+                    name, off, entry["read"], nonzero, entry["first_offset"],
+                    entry["first_value"], entry["context"],
+                )
+            else:
+                logger.info("VERIFY: %-6s offset=%-14d OK - %d bytes, all zero",
+                            name, off, entry["read"])
+            results.append(entry)
+
+        errors = [r for r in results if r["status"] == "error"]
+        mismatches = [r for r in results if r["status"] == "mismatch"]
+        if errors:
+            summary = (f"could not read the device back ({errors[0]['name']} region at "
+                       f"offset {errors[0]['offset']}: {errors[0]['error']})")
+        elif mismatches:
+            m = mismatches[0]
+            summary = (f"device still contains data - {m['nonzero']:,} non-zero bytes in the "
+                       f"{m['name']} region, first at byte {m['first_offset']} "
+                       f"(0x{m['first_value']:02X}). The overwrite did not take effect.")
+        else:
+            summary = (f"{len(results)} region(s) sampled through the locked handle, all zero "
+                       f"({sample_size * len(results):,} bytes read)")
+
+        ok = not errors and not mismatches
+        logger.info("VERIFY: result=%s - %s", "PASS" if ok else "FAIL", summary)
+        return {"ok": ok, "summary": summary, "regions": results,
+                "device": device_path, "size": size,
+                "size_source": "locked handle (IOCTL_DISK_GET_LENGTH_INFO)"}
+
+    # NOTE: the previous `diskpart clean all` delegation was removed. It exited 0
+    # on failure (real errors went only to the VDS event log), gave no progress
+    # for the ~17 minutes a full-device zero takes, and released the disk to
+    # Windows before verification could read it back. _windows_raw_overwrite()
+    # above does the write in-process instead. There is deliberately no fallback
+    # to diskpart: silently retrying with a mechanism known to misreport success
+    # is exactly the failure mode this replaced.
+
+    def _write_pattern(self, device_path: str, pattern: Optional[bytes],
                       progress_callback: Optional[Callable] = None,
                       offset: int = 0, max_progress: int = 100) -> None:
         """Write a specific pattern to device"""
@@ -476,35 +702,239 @@ class WipeMethods:
         except subprocess.CalledProcessError as e:
             raise Exception(f"Pattern write failed: {e}")
     
-    def _verify_zeroed(self, device_path: str) -> bool:
-        """Verify multiple sampled regions are zeroed (head, middle, tail)."""
-        try:
-            sample_size = 1024 * 1024
-            file_size = None
+    # Alignment used for raw-device reads. 4096 is safe for both 512e and 4Kn
+    # media; reads that straddle a sector boundary are rejected by the driver.
+    _SECTOR_ALIGN = 4096
+
+    def _device_size_bytes(self, device_path: str) -> Tuple[Optional[int], str]:
+        """Usable size of the target, plus how it was determined (diagnostics).
+
+        os.path.getsize() reports 0 for a Windows raw device such as
+        \\\\.\\PhysicalDrive2, so the previous code always fell back to sampling
+        only the first megabyte - the middle and tail were never checked at all.
+        Ask the disk driver instead.
+        """
+        if self.is_windows and "physicaldrive" in device_path.lower():
             try:
-                file_size = os.path.getsize(device_path)
-            except Exception:
-                file_size = None
-            def _check_region(offset_bytes: int) -> bool:
-                try:
-                    with open(device_path, 'rb') as f:
-                        if offset_bytes > 0:
-                            f.seek(offset_bytes)
-                        data = f.read(sample_size)
-                        if not data:
-                            return True
-                        return all(b == 0 for b in data)
-                except Exception:
-                    return False
-            offsets = [0]
-            if file_size and file_size > sample_size * 2:
-                offsets.append(max(0, file_size // 2))
-                offsets.append(max(0, file_size - sample_size))
-            return all(_check_region(o) for o in offsets)
+                import ctypes
+                from ctypes import wintypes
+
+                GENERIC_READ = 0x80000000
+                FILE_SHARE_READ = 0x00000001
+                FILE_SHARE_WRITE = 0x00000002
+                OPEN_EXISTING = 3
+                IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+                INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+                k32 = ctypes.windll.kernel32
+                # restype MUST be HANDLE: the default c_int truncates 64-bit
+                # handles and the validity check would then be meaningless.
+                k32.CreateFileW.restype = wintypes.HANDLE
+                k32.CreateFileW.argtypes = [
+                    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                    wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+                ]
+                handle = k32.CreateFileW(
+                    device_path, GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None, OPEN_EXISTING, 0, None,
+                )
+                if handle and handle != INVALID_HANDLE_VALUE:
+                    try:
+                        length = ctypes.c_ulonglong(0)
+                        returned = wintypes.DWORD(0)
+                        ok = k32.DeviceIoControl(
+                            wintypes.HANDLE(handle), IOCTL_DISK_GET_LENGTH_INFO,
+                            None, 0, ctypes.byref(length), ctypes.sizeof(length),
+                            ctypes.byref(returned), None,
+                        )
+                        if ok and length.value:
+                            return int(length.value), "IOCTL_DISK_GET_LENGTH_INFO"
+                        logger.debug("IOCTL_DISK_GET_LENGTH_INFO failed: err=%s",
+                                     ctypes.get_last_error())
+                    finally:
+                        k32.CloseHandle(wintypes.HANDLE(handle))
+                else:
+                    logger.debug("CreateFileW on %s failed: err=%s",
+                                 device_path, ctypes.GetLastError())
+            except Exception as e:
+                logger.debug("Windows size probe failed: %s", e)
+
+        try:
+            size = os.path.getsize(device_path)
+            if size > 0:
+                return size, "os.path.getsize"
+        except Exception:
+            pass
+
+        try:
+            with open(device_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size > 0:
+                    return size, "seek-to-end"
+        except Exception:
+            pass
+
+        return None, "unknown"
+
+    def _verify_region(self, device_path: str, name: str, offset: int,
+                       length: int) -> Dict[str, Any]:
+        """Read one region back and report exactly what was found there."""
+        result = {
+            "name": name, "offset": offset, "requested": length, "read": 0,
+            "status": "ok", "nonzero": 0, "first_offset": -1,
+            "first_value": 0, "context": "", "error": None,
+        }
+        try:
+            # buffering=0: let every read go straight to the device instead of
+            # through Python's buffer, so sizes/offsets stay sector aligned and
+            # nothing is served from a stale user-space buffer.
+            with open(device_path, "rb", buffering=0) as f:
+                if offset:
+                    f.seek(offset)
+                data = bytearray()
+                while len(data) < length:
+                    chunk = f.read(length - len(data))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
         except Exception as e:
-            logger.error(f"Verification failed: {e}")
-            return False
-    
+            result["status"] = "error"
+            result["error"] = f"{type(e).__name__}: {e}"
+            return result
+
+        result["read"] = len(data)
+        if not data:
+            # Previously an empty read was treated as "verified" - a device that
+            # could not be read at all counted as proof it was clean.
+            result["status"] = "error"
+            result["error"] = "read returned no data"
+            return result
+
+        nonzero = len(data) - data.count(0)
+        if nonzero:
+            first = next(i for i, b in enumerate(data) if b)
+            lo, hi = max(0, first - 8), min(len(data), first + 24)
+            result.update(
+                status="mismatch",
+                nonzero=nonzero,
+                first_offset=offset + first,
+                first_value=data[first],
+                context=bytes(data[lo:hi]).hex(" "),
+            )
+        return result
+
+    def _verify_zeroed(self, device_path: str) -> Dict[str, Any]:
+        """Read back sampled regions and confirm the device really is zeroed.
+
+        Returns a structured result rather than a bare bool: a read failure and
+        genuinely non-zero data are completely different problems, and collapsing
+        both into False produced an unexplained "Clear verification failed".
+        """
+        # Prefer the read-back taken while the device was still locked by the
+        # overwrite. Re-opening a Windows physical disk after release is not
+        # equivalent: the disk is RAW by then and Windows re-initialises it
+        # within moments, writing a fresh MBR to sector 0. That MBR is Windows'
+        # own, not residual user data, but a fresh read cannot tell them apart -
+        # which is exactly what produced the false "385 non-zero bytes at byte 0
+        # (0x33)" failure. This is not a relaxation: the inline check is the
+        # stricter one (unbuffered, exclusive) and a failure there still aborts.
+        inline = self._inline_verification
+        if (
+            inline
+            and inline.get("device") == device_path
+            and (time.time() - inline.get("at", 0)) < 300
+        ):
+            logger.info(
+                "VERIFY: using the read-back taken while %s was still locked "
+                "(prevents Windows' post-clean re-initialisation from being "
+                "mistaken for residual data)",
+                device_path,
+            )
+            return inline["result"]
+
+        sample_size = 1024 * 1024
+        size, size_source = self._device_size_bytes(device_path)
+
+        logger.info(
+            "VERIFY: target=%s size=%s bytes (via %s) sample=%d bytes/region expected=0x00",
+            device_path,
+            f"{size:,}" if size else "unknown",
+            size_source,
+            sample_size,
+        )
+
+        if size and size > sample_size * 3:
+            align = self._SECTOR_ALIGN
+            regions = [
+                ("head", 0),
+                ("middle", ((size // 2) // align) * align),
+                ("tail", ((size - sample_size) // align) * align),
+            ]
+        else:
+            regions = [("head", 0)]
+            logger.warning(
+                "VERIFY: only the head region can be sampled (size=%s) - "
+                "coverage is reduced", size,
+            )
+
+        results = []
+        for name, offset in regions:
+            r = self._verify_region(device_path, name, offset, sample_size)
+            results.append(r)
+            if r["status"] == "error":
+                logger.error(
+                    "VERIFY: %-6s offset=%-14d READ FAILED: %s",
+                    name, offset, r["error"],
+                )
+            elif r["status"] == "mismatch":
+                logger.error(
+                    "VERIFY: %-6s offset=%-14d NOT ZERO - read=%d bytes, %d non-zero, "
+                    "first at byte %d = 0x%02X, context=[%s]",
+                    name, offset, r["read"], r["nonzero"],
+                    r["first_offset"], r["first_value"], r["context"],
+                )
+            else:
+                logger.info(
+                    "VERIFY: %-6s offset=%-14d OK - %d bytes, all zero",
+                    name, offset, r["read"],
+                )
+
+        errors = [r for r in results if r["status"] == "error"]
+        mismatches = [r for r in results if r["status"] == "mismatch"]
+
+        if errors:
+            summary = (
+                f"could not read the device back ({errors[0]['name']} region at "
+                f"offset {errors[0]['offset']}: {errors[0]['error']})"
+            )
+        elif mismatches:
+            m = mismatches[0]
+            summary = (
+                f"device still contains data - {m['nonzero']:,} non-zero bytes in the "
+                f"{m['name']} region, first at byte {m['first_offset']} "
+                f"(0x{m['first_value']:02X}). The overwrite did not take effect."
+            )
+        else:
+            summary = (
+                f"{len(results)} region(s) sampled, all zero "
+                f"({sample_size * len(results):,} bytes read)"
+            )
+
+        ok = not errors and not mismatches
+        logger.info("VERIFY: result=%s - %s", "PASS" if ok else "FAIL", summary)
+
+        return {
+            "ok": ok,
+            "summary": summary,
+            "regions": results,
+            "device": device_path,
+            "size": size,
+            "size_source": size_source,
+        }
+
+
     def _ata_sanitize(self, device_path: str, progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
         """ATA sanitize command"""
         try:

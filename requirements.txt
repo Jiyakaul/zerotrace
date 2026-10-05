@@ -5,6 +5,7 @@ pydantic==2.9.2
 cryptography==43.0.3
 reportlab==4.2.2
 Pillow==10.4.0
+qrcode==8.2
 pyhanko==0.23.0
 pyhanko-certvalidator==0.26.3
 requests==2.32.3

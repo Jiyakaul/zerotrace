@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import paths
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -12,12 +13,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/zerotrace.db")
-DB_DIR = "data"
+# Paths are anchored to the backend package, not the working directory.
+DB_DIR = str(paths.DATA_DIR)
 DB_FILE = os.path.join(DB_DIR, "zerotrace.db")
 
 # Ensure data directory exists
-os.makedirs(DB_DIR, exist_ok=True)
+paths.ensure_dirs()
+
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DB_FILE}")
 
 # Create engine with proper configuration
 if DATABASE_URL.startswith("sqlite"):

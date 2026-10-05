@@ -24,8 +24,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
 
 import logging
+import paths
 from pyhanko.sign import signers
 from pyhanko_certvalidator.context import ValidationContext
 from pyhanko import stamp
@@ -36,9 +38,9 @@ logger = logging.getLogger(__name__)
 class CertificateGenerator:
     """Advanced certificate generator with tamper-proof features"""
     
-    def __init__(self, keys_dir: str = "keys"):
-        self.keys_dir = Path(keys_dir)
-        self.keys_dir.mkdir(exist_ok=True)
+    def __init__(self, keys_dir: Optional[str] = None):
+        self.keys_dir = Path(keys_dir) if keys_dir else paths.KEYS_DIR
+        self.keys_dir.mkdir(parents=True, exist_ok=True)
         self.private_key_path = self.keys_dir / "private.pem"
         self.public_key_path = self.keys_dir / "public.pem"
         self.certificate_path = self.keys_dir / "certificate.pem"
@@ -81,7 +83,12 @@ class CertificateGenerator:
             
             # Generate self-signed certificate
             self._generate_self_signed_certificate(private_key, public_key)
-            
+
+            # Keep the in-memory handle so signing works on the very first run
+            # (previously only _load_keys() set this, so a fresh install could
+            # never sign a JSON certificate).
+            self.private_key = private_key
+
             logger.info("Generated new cryptographic keys")
             
         except Exception as e:
@@ -140,8 +147,8 @@ class CertificateGenerator:
         """Generate tamper-proof PDF certificate"""
         try:
             # Create reports directory
-            reports_dir = Path("reports")
-            reports_dir.mkdir(exist_ok=True)
+            reports_dir = paths.REPORTS_DIR
+            reports_dir.mkdir(parents=True, exist_ok=True)
             
             # Generate filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -338,8 +345,8 @@ class CertificateGenerator:
         """Generate tamper-proof JSON certificate"""
         try:
             # Create reports directory
-            reports_dir = Path("reports")
-            reports_dir.mkdir(exist_ok=True)
+            reports_dir = paths.REPORTS_DIR
+            reports_dir.mkdir(parents=True, exist_ok=True)
             
             # Generate filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -446,8 +453,8 @@ class CertificateGenerator:
         """Generate a QR code PNG file for the provided data and return its path."""
         try:
             import qrcode
-            reports_dir = Path("reports")
-            reports_dir.mkdir(exist_ok=True)
+            reports_dir = paths.REPORTS_DIR
+            reports_dir.mkdir(parents=True, exist_ok=True)
             qr_path = reports_dir / f"qr_{hashlib.sha256(data.encode('utf-8')).hexdigest()[:10]}.png"
             img = qrcode.make(data)
             img.save(str(qr_path))
@@ -511,26 +518,43 @@ class CertificateGenerator:
     def _sign_pdf(self, filepath: str):
         """Sign PDF with digital signature using PyHanko (detached signature saved as .p7s)"""
         try:
-            # Prepare signer from PEM key and self-signed certificate
-            with open(self.private_key_path, 'rb') as key_f, open(self.certificate_path, 'rb') as cert_f:
-                signer = signers.SimpleSigner.load(key_f.read(), cert_f.read(), key_passphrase=None)
+            # Prepare signer from PEM key and self-signed certificate.
+            # SimpleSigner.load() takes *paths*, not file contents.
+            signer = signers.SimpleSigner.load(
+                str(self.private_key_path),
+                str(self.certificate_path),
+                key_passphrase=None,
+            )
+            if signer is None:
+                raise RuntimeError("Could not load signing key/certificate")
 
-            with open(filepath, 'rb') as inf:
+            # Sign into a temporary file first. Writing to `filepath` while the
+            # IncrementalPdfFileWriter still reads from it truncates the source
+            # mid-sign and corrupts the certificate.
+            meta = signers.PdfSignatureMetadata(field_name='ZeroTraceSignature', md_algorithm='sha256')
+            pdf_signer = signers.PdfSigner(meta, signer)
+            tmp_path = f"{filepath}.signing.tmp"
+            with open(filepath, 'rb') as inf, open(tmp_path, 'wb') as outf:
                 w = IncrementalPdfFileWriter(inf)
-                meta = signers.PdfSignatureMetadata(field_name='ZeroTraceSignature', md_algorithm='sha256')
-                pdf_signer = signers.PdfSigner(meta, signer)
-                with open(filepath, 'wb') as outf:
-                    pdf_signer.sign_pdf(w, output=outf)
+                pdf_signer.sign_pdf(w, output=outf)
+            os.replace(tmp_path, filepath)
 
-            # Also export detached CMS signature for external verification
+            # Also export detached CMS signature for external verification.
+            # sign() expects a digest; sign_general_data() takes the content.
             with open(filepath, 'rb') as f:
                 content = f.read()
-            cms = signer.sign(content, 'sha256')
+            cms = signer.sign_general_data(content, 'sha256', detached=True)
             with open(f"{filepath}.p7s", 'wb') as sigf:
                 sigf.write(cms.dump())
 
             logger.info(f"PDF signed with PyHanko: {filepath} (.p7s saved)")
         except Exception as e:
+            tmp_path = f"{filepath}.signing.tmp"
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
             logger.error(f"Failed to sign PDF: {e}")
     
     def _sign_json(self, filepath: str, data: Dict[str, Any]):
@@ -597,9 +621,16 @@ class CertificateGenerator:
             )
             
             return {"valid": True, "message": "Certificate is authentic and untampered"}
-            
+
+        except InvalidSignature:
+            # InvalidSignature stringifies to "", which surfaced as a blank error
+            return {
+                "valid": False,
+                "error": "Signature does not match the certificate contents "
+                         "(the file has been modified or was signed with a different key)",
+            }
         except Exception as e:
-            return {"valid": False, "error": str(e)}
+            return {"valid": False, "error": str(e) or e.__class__.__name__}
 
 # Global instance
 certificate_generator = CertificateGenerator()

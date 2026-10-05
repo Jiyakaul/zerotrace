@@ -1,158 +1,234 @@
-import React, { useState, useEffect } from 'react';
-import { FaSpinner, FaCheckCircle, FaExclamationTriangle, FaTimesCircle } from 'react-icons/fa';
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  LuTriangleAlert,
+  LuCircleCheck,
+  LuArrowLeft,
+  LuHardDrive,
+  LuClock,
+  LuGauge,
+  LuScrollText,
+  LuCircleAlert,
+} from 'react-icons/lu';
+import { formatBytes, formatDuration, getMethodMeta } from '../lib/format';
+import { Alert, Badge, Button, ProgressRing, StatusDot } from './ui/Primitives';
+import { describeWipeError } from '../lib/wipeErrors';
 
-function WipeProgress({ selectedDevices, method, passes, progress, status, error, onBack }) {
-  const [startTime] = useState(Date.now());
-  const [elapsedTime, setElapsedTime] = useState(0);
+const STAGES = [
+  { id: 'prepare', label: 'Preparing device', at: 0 },
+  { id: 'overwrite', label: 'Overwriting media', at: 5 },
+  { id: 'verify', label: 'Verifying erasure', at: 75 },
+  { id: 'certify', label: 'Issuing certificate', at: 96 },
+];
+
+export default function WipeProgress({
+  selectedDevices, method, passes, progress, status, error, errorPayload, system, onBack,
+}) {
+  const [startTime] = useState(() => Date.now());
+  const [elapsed, setElapsed] = useState(0);
+
+  const done = progress >= 100 && !error;
+  const failed = Boolean(error);
+
+  // Categorised description of the real failure. Falls back to the plain
+  // message when the backend did not send structured fields.
+  const errorInfo = useMemo(
+    () => describeWipeError(errorPayload || { error }, system),
+    [errorPayload, error, system]
+  );
+  const running = !done && !failed;
 
   useEffect(() => {
-    const interval = setInterval(() => {
-      setElapsedTime(Math.floor((Date.now() - startTime) / 1000));
-    }, 1000);
+    if (!running) return undefined;
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - startTime) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [running, startTime]);
 
-    return () => clearInterval(interval);
-  }, [startTime]);
+  const meta = getMethodMeta(method);
+  const device = selectedDevices[0] || {};
 
-  const formatTime = (seconds) => {
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = seconds % 60;
-    
-    if (hours > 0) {
-      return `${hours}h ${minutes}m ${secs}s`;
-    } else if (minutes > 0) {
-      return `${minutes}m ${secs}s`;
-    } else {
-      return `${secs}s`;
-    }
-  };
+  const remaining = useMemo(() => {
+    if (!running || progress <= 0 || elapsed <= 0) return null;
+    return Math.floor((elapsed / progress) * (100 - progress));
+  }, [running, progress, elapsed]);
 
-  const getStatusIcon = () => {
-    if (error) return <FaTimesCircle className="error-icon" />;
-    if (progress >= 100) return <FaCheckCircle className="success-icon" />;
-    return <FaSpinner className="spinning-icon" />;
-  };
-
-  const getStatusColor = () => {
-    if (error) return 'error';
-    if (progress >= 100) return 'success';
-    return 'in-progress';
-  };
-
-  const getMethodDisplayName = (method) => {
-    const names = {
-      'nist_800_88': 'NIST 800-88',
-      'dod_5220_22_m': 'DoD 5220.22-M',
-      'gutmann': 'Gutmann (35-pass)',
-      'crypto_erase': 'Cryptographic Erase',
-      'ata_sanitize': 'ATA Sanitize',
-      'nvme_format': 'NVMe Format',
-      'single_pass': 'Single Pass',
-      'three_pass': 'Three Pass'
-    };
-    return names[method] || method;
-  };
+  const tone = failed ? 'danger' : done ? 'success' : 'brand';
+  const activeStage = STAGES.reduce(
+    (acc, s) => (progress >= s.at ? s.id : acc),
+    STAGES[0].id
+  );
 
   return (
-    <div className="card">
-      <h2>Wipe Progress</h2>
-      
-      <div className="progress-header">
-        <div className="device-info">
-          <h3>Wiping Device:</h3>
-          <p><strong>{selectedDevices[0]?.name || selectedDevices[0]?.model || 'Unknown'}</strong></p>
-          <p className="device-path">{selectedDevices[0]?.path}</p>
-        </div>
-        
-        <div className="method-info">
-          <h3>Method:</h3>
-          <p><strong>{getMethodDisplayName(method)}</strong></p>
-          {passes > 1 && <p>Passes: {passes}</p>}
-        </div>
-      </div>
+    <div className="page page--progress">
+      <div className="progress-layout">
+        {/* Ring ------------------------------------------------------------ */}
+        <section className={`card progress-hero progress-hero--${tone}`}>
+          <ProgressRing value={failed ? 100 : progress} tone={tone} size={216} stroke={14}>
+            {failed ? (
+              <>
+                <LuCircleAlert className="progress-hero__glyph" aria-hidden="true" />
+                <span className="progress-hero__state">Failed</span>
+              </>
+            ) : done ? (
+              <>
+                <LuCircleCheck className="progress-hero__glyph" aria-hidden="true" />
+                <span className="progress-hero__state">Complete</span>
+              </>
+            ) : (
+              <>
+                <span className="progress-hero__pct">{Math.round(progress)}</span>
+                <span className="progress-hero__unit">percent</span>
+              </>
+            )}
+          </ProgressRing>
 
-      <div className={`progress-container ${getStatusColor()}`}>
-        <div className="progress-bar">
-          <div 
-            className="progress-fill"
-            style={{ width: `${Math.min(progress, 100)}%` }}
-          ></div>
-        </div>
-        <div className="progress-text">
-          <span className="progress-percentage">{Math.round(progress)}%</span>
-          <span className="progress-status">{status}</span>
-        </div>
-      </div>
-
-      <div className="progress-details">
-        <div className="detail-item">
-          <span className="detail-label">Elapsed Time:</span>
-          <span className="detail-value">{formatTime(elapsedTime)}</span>
-        </div>
-        
-        <div className="detail-item">
-          <span className="detail-label">Status:</span>
-          <span className={`detail-value status-${getStatusColor()}`}>
-            {getStatusIcon()}
-            {error ? 'Failed' : progress >= 100 ? 'Completed' : 'In Progress'}
-          </span>
-        </div>
-
-        {progress > 0 && progress < 100 && (
-          <div className="detail-item">
-            <span className="detail-label">Estimated Remaining:</span>
-            <span className="detail-value">
-              {elapsedTime > 0 ? formatTime(Math.floor((elapsedTime / progress) * (100 - progress))) : 'Calculating...'}
-            </span>
+          <div className="progress-hero__meta">
+            <div className="progress-hero__status">
+              <StatusDot tone={failed ? 'danger' : done ? 'success' : 'info'} pulse={running} />
+              <span>{status || (running ? 'Working…' : done ? 'Finished' : 'Stopped')}</span>
+            </div>
+            <p className="progress-hero__note">
+              {running
+                ? 'Keep this window open and the device connected until the operation finishes.'
+                : done
+                ? 'The device was sanitised successfully and a certificate has been issued.'
+                : 'The operation stopped before completing.'}
+            </p>
           </div>
-        )}
+        </section>
+
+        {/* Details --------------------------------------------------------- */}
+        <div className="progress-side">
+          <section className="card card--flush">
+            <header className="card__header">
+              <span className="card__header-icon" aria-hidden="true"><LuHardDrive /></span>
+              <div className="card__header-text">
+                <h3 className="card__title">Operation</h3>
+                <p className="card__desc">{meta.name}</p>
+              </div>
+            </header>
+            <div className="card__content">
+              <dl className="datalist datalist--1">
+                <div className="datalist__item">
+                  <dt className="datalist__label">Device</dt>
+                  <dd className="datalist__value zt-truncate">{device.name || device.model || 'Unknown'}</dd>
+                </div>
+                <div className="datalist__item">
+                  <dt className="datalist__label">Path</dt>
+                  <dd className="datalist__value mono zt-truncate">{device.path || 'N/A'}</dd>
+                </div>
+                <div className="datalist__item">
+                  <dt className="datalist__label">Capacity</dt>
+                  <dd className="datalist__value">{formatBytes(device.size)}</dd>
+                </div>
+                <div className="datalist__item">
+                  <dt className="datalist__label">Passes</dt>
+                  <dd className="datalist__value">{passes || 1}</dd>
+                </div>
+              </dl>
+            </div>
+          </section>
+
+          <section className="card card--flush">
+            <header className="card__header">
+              <span className="card__header-icon" aria-hidden="true"><LuGauge /></span>
+              <div className="card__header-text">
+                <h3 className="card__title">Timing</h3>
+                <p className="card__desc">Live measurements</p>
+              </div>
+            </header>
+            <div className="card__content">
+              <div className="metric-row">
+                <div className="metric">
+                  <span className="metric__label"><LuClock aria-hidden="true" /> Elapsed</span>
+                  <span className="metric__value">{formatDuration(elapsed)}</span>
+                </div>
+                <div className="metric">
+                  <span className="metric__label"><LuGauge aria-hidden="true" /> Remaining</span>
+                  <span className="metric__value">
+                    {failed ? '—' : done ? '0s' : remaining === null ? 'Estimating…' : formatDuration(remaining)}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
       </div>
 
-      {error && (
-        <div className="error-section">
-          <FaExclamationTriangle className="error-icon" />
-          <div className="error-content">
-            <h3>Wipe Failed</h3>
-            <p className="error-message">{error}</p>
-            <p>Please check the device connection and try again.</p>
+      {/* Stage timeline ----------------------------------------------------- */}
+      <section className="card card--flush">
+        <header className="card__header">
+          <span className="card__header-icon" aria-hidden="true"><LuScrollText /></span>
+          <div className="card__header-text">
+            <h3 className="card__title">Stages</h3>
+            <p className="card__desc">Sanitisation pipeline</p>
           </div>
+        </header>
+        <div className="card__content">
+          <ol className="timeline">
+            {STAGES.map((s) => {
+              const complete = !failed && progress > s.at && (progress >= 100 || activeStage !== s.id);
+              const current = !failed && activeStage === s.id && progress < 100;
+              const state = failed && current ? 'failed' : complete ? 'done' : current ? 'active' : 'idle';
+              return (
+                <li className={`timeline__step timeline__step--${state}`} key={s.id}>
+                  <span className="timeline__marker" aria-hidden="true">
+                    {state === 'done' ? <LuCircleCheck /> : state === 'failed' ? <LuCircleAlert /> : <span className="timeline__pip" />}
+                  </span>
+                  <span className="timeline__label">{s.label}</span>
+                  {current && <Badge tone="info" size="sm">In progress</Badge>}
+                  {state === 'done' && <Badge tone="success" size="sm">Done</Badge>}
+                </li>
+              );
+            })}
+          </ol>
         </div>
+      </section>
+
+      {failed && (
+        <Alert tone="danger" icon={LuTriangleAlert} title={errorInfo.title}>
+          <p className="alert__mono mono">{errorInfo.message}</p>
+
+          {errorInfo.facts.length > 0 && (
+            <ul className="fault-facts">
+              {errorInfo.facts.map((f) => (
+                <li key={f.label}>
+                  <span>{f.label}</span>
+                  <strong className="mono">{f.value}</strong>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {/* Shown only when the backend's real process token says privileges
+              are missing - never as a blanket explanation for any failure. */}
+          {errorInfo.hint && <p>{errorInfo.hint}</p>}
+        </Alert>
       )}
 
-      {progress >= 100 && !error && (
-        <div className="success-section">
-          <FaCheckCircle className="success-icon" />
-          <div className="success-content">
-            <h3>Wipe Completed Successfully!</h3>
-            <p>Your data has been securely erased using {getMethodDisplayName(method)} method.</p>
-            <p>Total time: {formatTime(elapsedTime)}</p>
-          </div>
-        </div>
+      {done && (
+        <Alert tone="success" icon={LuCircleCheck} title="Sanitisation complete">
+          The device was erased using {meta.name} in {formatDuration(elapsed)}. A signed certificate
+          of destruction has been generated.
+        </Alert>
       )}
 
-      <div className="progress-warning">
-        <FaExclamationTriangle className="warning-icon" />
-        <p>
-          <strong>Important:</strong> Do not disconnect the device or close this application 
-          during the wipe process. This could result in data corruption or incomplete wiping.
-        </p>
-      </div>
+      {running && (
+        <Alert tone="warn" icon={LuTriangleAlert} title="Do not interrupt">
+          Disconnecting the device or closing the application now can leave the media in a partially
+          sanitised state.
+        </Alert>
+      )}
 
-      <div className="button-group">
-        {!error && progress < 100 && (
-          <button onClick={onBack} className="secondary-button" disabled>
-            ← Back (Disabled during wipe)
-          </button>
-        )}
-        
-        {(error || progress >= 100) && (
-          <button onClick={onBack} className="primary-button">
-            ← Back
-          </button>
-        )}
+      <div className="page__footer">
+        <Button
+          variant={running ? 'ghost' : 'primary'}
+          icon={LuArrowLeft}
+          onClick={onBack}
+          disabled={running}
+        >
+          {running ? 'Back (locked during erasure)' : 'Back'}
+        </Button>
       </div>
     </div>
   );
 }
-
-export default WipeProgress;

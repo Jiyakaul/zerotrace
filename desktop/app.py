@@ -2,6 +2,7 @@
 import os
 import sys
 import hashlib
+import platform
 import threading
 import time
 from datetime import datetime
@@ -29,7 +30,9 @@ class WipeWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self):
         try:
-            methods = WipeMethods(os.name)
+            # WipeMethods expects 'windows'/'linux'/'darwin';
+            # os.name gives 'nt'/'posix'
+            methods = WipeMethods(platform.system().lower())
             start_ts = time.time()
 
             sha_before = None

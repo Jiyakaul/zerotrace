@@ -1,6 +1,7 @@
 ﻿import os
 import time
 import logging
+import paths
 from datetime import datetime
 from typing import Dict, Any
 from .certificate_generator import certificate_generator
@@ -69,9 +70,9 @@ def generate_json_report(device, method, passes, sha_before, sha_after, status, 
 def _generate_simple_pdf_report(device, method, passes, sha_before, sha_after, status, start_ts, end_ts):
     """Fallback simple PDF report generation"""
     try:
-        os.makedirs("reports", exist_ok=True)
+        paths.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         ts = int(start_ts)
-        path = f"reports/wipe_report_{ts}.pdf"
+        path = str(paths.REPORTS_DIR / f"wipe_report_{ts}.pdf")
         
         from reportlab.pdfgen import canvas
         from reportlab.lib.pagesizes import A4
@@ -92,16 +93,37 @@ def _generate_simple_pdf_report(device, method, passes, sha_before, sha_after, s
         return None
 
 def sign_report_with_openssl(pdf_path, private_key="keys/private.pem"):
-    """Legacy function for backward compatibility"""
+    """Return the detached signature for a report, signing only if needed.
+
+    generate_pdf_certificate() already signs the PDF it produces and writes the
+    detached .p7s next to it. This function then signed the *same* file a second
+    time, which made PyHanko fail with "Signature field with name
+    ZeroTraceSignature appears to be filled already" and logged an error on
+    every successful wipe.
+
+    Signing is now only performed when no signature exists yet - which is still
+    the case for the unsigned fallback report from _generate_simple_pdf_report().
+    """
     try:
-        # Use the new certificate generator for signing
-        certificate_generator._sign_pdf(pdf_path)
-        # Prefer .p7s created by _sign_pdf
+        if not pdf_path or not os.path.exists(pdf_path):
+            logger.warning("No report to sign: %s", pdf_path)
+            return None
+
         p7s_path = f"{pdf_path}.p7s"
+        sig_path = f"{pdf_path}.sig"
+
+        # Already signed during generation - reuse it, do not re-sign.
+        if os.path.exists(p7s_path):
+            logger.info("Report already signed during generation: %s", p7s_path)
+            return p7s_path
+        if os.path.exists(sig_path):
+            logger.info("Report already signed during generation: %s", sig_path)
+            return sig_path
+
+        certificate_generator._sign_pdf(pdf_path)
+
         if os.path.exists(p7s_path):
             return p7s_path
-        # Fallback: if a .sig exists, return it
-        sig_path = f"{pdf_path}.sig"
         if os.path.exists(sig_path):
             return sig_path
         return None

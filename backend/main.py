@@ -5,6 +5,7 @@ from fastapi.responses import FileResponse
 import os
 import logging
 
+import paths
 from routes.api import router as api_router
 from database import init_database
 
@@ -37,15 +38,14 @@ app.add_middleware(
 app.include_router(api_router, prefix="/api")
 
 # Mount static files for reports
-if not os.path.exists("reports"):
-    os.makedirs("reports")
-app.mount("/reports", StaticFiles(directory="reports"), name="reports")
+paths.ensure_dirs()
+app.mount("/reports", StaticFiles(directory=str(paths.REPORTS_DIR)), name="reports")
 
 # Serve built web frontend (Vite) from FastAPI (dynamic check so it's resilient)
-FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'frontend', 'web', 'dist'))
+FRONTEND_DIST = str(paths.FRONTEND_DIST)
 index_path = os.path.join(FRONTEND_DIST, "index.html")
 assets_dir = os.path.join(FRONTEND_DIST, "assets")
-FRONTEND_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'frontend', 'web'))
+FRONTEND_SRC = str(paths.FRONTEND_DIR)
 
 # Mount assets even if not yet present; they'll appear after build
 app.mount("/assets", StaticFiles(directory=assets_dir, check_dir=False), name="assets")
@@ -94,4 +94,7 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Loopback by default: /api/wipe is unauthenticated and destructive, and
+    # CORS is wide open, so binding to 0.0.0.0 would expose disk erasure to the
+    # local network. Override deliberately if you really need remote access.
+    uvicorn.run(app, host=os.getenv("ZEROTRACE_HOST", "127.0.0.1"), port=int(os.getenv("ZEROTRACE_PORT", "8000")))

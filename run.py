@@ -12,6 +12,27 @@ import signal
 import threading
 from pathlib import Path
 
+
+def _use_utf8_console():
+    """Make stdout/stderr tolerate the banner and emoji in this script.
+
+    A default Windows console hands Python a cp1252 stdout, so the very first
+    print() of the box-drawing banner raised UnicodeEncodeError and `python
+    run.py` died before starting anything.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+_use_utf8_console()
+
+
 def print_banner():
     print("""
     ╔══════════════════════════════════════════════════════════════╗
@@ -54,19 +75,20 @@ def start_backend():
     """Start the FastAPI backend server"""
     print("🚀 Starting ZeroTrace Backend...")
     
-    # Change to backend directory
+    # Run from the backend directory via cwd= rather than os.chdir(): in
+    # "both" mode this function runs on a worker thread, and os.chdir() changes
+    # the working directory for the whole process, racing the frontend thread.
     backend_dir = Path(__file__).parent / "backend"
-    os.chdir(backend_dir)
-    
+
     # Start the server
     try:
         subprocess.run([
             sys.executable, "-m", "uvicorn", 
             "main:app", 
-            "--host", "0.0.0.0", 
+            "--host", "127.0.0.1", 
             "--port", "8000",
             "--reload"
-        ], check=True)
+        ], cwd=str(backend_dir), check=True)
     except KeyboardInterrupt:
         print("\n🛑 Backend stopped by user")
     except subprocess.CalledProcessError as e:
@@ -77,22 +99,22 @@ def start_frontend():
     """Start the React frontend development server"""
     print("🎨 Starting ZeroTrace Frontend...")
     
-    # Change to frontend web directory
     frontend_dir = Path(__file__).parent / "frontend" / "web"
-    os.chdir(frontend_dir)
-    
+
     # Check if node_modules exists
     if not (frontend_dir / "node_modules").exists():
         print("📦 Installing frontend dependencies...")
         try:
-            subprocess.run(["npm", "install"], check=True)
+            subprocess.run(["npm", "install"], cwd=str(frontend_dir),
+                           shell=(os.name == "nt"), check=True)
         except subprocess.CalledProcessError as e:
             print(f"❌ Failed to install frontend dependencies: {e}")
             sys.exit(1)
     
     # Start the development server
     try:
-        subprocess.run(["npm", "run", "dev"], check=True)
+        subprocess.run(["npm", "run", "dev"], cwd=str(frontend_dir),
+                       shell=(os.name == "nt"), check=True)
     except KeyboardInterrupt:
         print("\n🛑 Frontend stopped by user")
     except subprocess.CalledProcessError as e:

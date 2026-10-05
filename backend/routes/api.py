@@ -10,6 +10,8 @@ from services.wipe_engine import list_drives, initiate_wipe
 from database import get_db_session, get_wipe_history, get_session_progress, log_audit_event
 from models import WipeMethod, WipeStatus, WipeSession
 from pathlib import Path
+import paths
+import elevation
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -50,6 +52,13 @@ class WipeSessionResponse(BaseModel):
     report_path: Optional[str]
     signature_path: Optional[str]
 
+class ElevationRequest(BaseModel):
+    # Host/port the elevated instance should rebind to, so the already-loaded
+    # frontend keeps talking to the same origin after the handover.
+    host: str = "127.0.0.1"
+    port: int = 8000
+
+
 class VerifyRequest(BaseModel):
     file_path: str
     embedded_pdf: bool = False
@@ -77,7 +86,27 @@ def api_wipe(req: WipeRequest, background_tasks: BackgroundTasks):
     
     if not req.force:
         raise HTTPException(status_code=400, detail="force=True required for destructive operations")
-    
+
+    # Pre-flight privilege check. Raw block-device access needs an elevated
+    # process; refusing here means we never start a partial wipe that dies
+    # mid-pass on an access-denied error. This is an additional guard - it does
+    # not replace or relax the force=True requirement above.
+    if elevation.device_requires_elevation(req.device) and not elevation.is_admin():
+        log_audit_event(
+            "wipe_blocked_needs_admin", "device", req.device,
+            details=f"method={req.method}, passes={req.passes}",
+        )
+        return {
+            "result": {
+                "success": False,
+                "requires_admin": True,
+                "error": (
+                    "Administrator privileges are required to sanitise a physical drive. "
+                    "Grant them with Run as Administrator, then confirm the operation again."
+                ),
+            }
+        }
+
     try:
         # Log the wipe request
         log_audit_event("wipe_initiated", "device", req.device, 
@@ -109,9 +138,11 @@ def api_wipe_file(req: FileWipeRequest):
     try:
         from services.wipe_methods import WipeMethods
         from utils.report import generate_pdf_report, generate_json_report
+        import platform
         import time
 
-        methods = WipeMethods(os.name)
+        # WipeMethods expects 'windows'/'linux'/'darwin'; os.name gives 'nt'/'posix'
+        methods = WipeMethods(platform.system().lower())
         start_ts = time.time()
         sha_before = None
         # Head hash before wipe
@@ -286,7 +317,7 @@ def api_download_json_report(session_id: int):
         db.close()
         
         # Look for JSON report in reports directory
-        reports_dir = Path("reports")
+        reports_dir = paths.REPORTS_DIR
         json_files = list(reports_dir.glob(f"*session_{session_id}*.json"))
         
         if not json_files:
@@ -365,7 +396,7 @@ def api_verify_certificate(req: VerifyRequest):
 def api_list_certificates():
     """List all available certificates"""
     try:
-        reports_dir = Path("reports")
+        reports_dir = paths.REPORTS_DIR
         if not reports_dir.exists():
             return {"certificates": []}
         
@@ -401,6 +432,31 @@ def api_list_certificates():
     except Exception as e:
         logger.error(f"Failed to list certificates: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/system/status")
+def api_system_status(host: str = "127.0.0.1", port: int = 8000):
+    """Privilege level and elevation state, used by the UI to decide what to offer."""
+    return elevation.status(host, port)
+
+
+@router.post("/system/elevate")
+def api_system_elevate(req: ElevationRequest):
+    """Ask Windows for administrator privileges through the standard UAC prompt.
+
+    Returns immediately; the UAC dialog is user-driven so the caller polls
+    /system/status for the outcome. Elevation grants capability only - it never
+    starts, resumes or authorises a wipe, and the destructive endpoint keeps its
+    own independent confirmation requirements.
+    """
+    if not elevation.elevation_supported() and not elevation.is_admin():
+        raise HTTPException(
+            status_code=501,
+            detail="In-app elevation is only supported on Windows. Restart the backend with sudo.",
+        )
+
+    log_audit_event("elevation_requested", "system", f"{req.host}:{req.port}")
+    return elevation.request_elevation(req.host, req.port)
+
 
 @router.get("/health")
 def api_health():

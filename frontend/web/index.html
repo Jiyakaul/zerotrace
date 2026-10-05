@@ -3,12 +3,51 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ZeroTrace</title>
+    <meta name="color-scheme" content="dark light" />
+    <meta
+      name="description"
+      content="ZeroTrace - NIST 800-88 compliant secure data erasure with signed, tamper-evident certificates of destruction."
+    />
+    <title>ZeroTrace - Secure Data Erasure</title>
+
+    <!--
+      Webfonts load via <link> rather than a CSS @import so they never block
+      first paint: on an offline or air-gapped machine the UI renders
+      immediately with the system fallback stack instead of waiting for a
+      request that will time out.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      media="print"
+      onload="this.media='all'"
+    />
+    <noscript>
+      <link
+        rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      />
+    </noscript>
+
+    <!-- Paint the correct theme colour before React mounts to avoid a flash. -->
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem('zerotrace.theme');
+          var prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+          var theme = stored === 'light' || stored === 'dark' ? stored : prefersLight ? 'light' : 'dark';
+          document.documentElement.setAttribute('data-theme', theme);
+          document.documentElement.style.background = theme === 'light' ? '#F4F6FA' : '#080B11';
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
-  </html>
-
-
+</html>
